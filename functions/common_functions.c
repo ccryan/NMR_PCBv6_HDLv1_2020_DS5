@@ -20,7 +20,7 @@
 #include "AlteraIP/altera_avalon_fifo_regs.h"
 
 unsigned int rd_FIFO(volatile unsigned int *FIFO_status_addr,
-		void *FIFO_data_addr, unsigned int * buf32)
+		void *FIFO_data_addr, int * buf32)
 {
 
 	// local variables
@@ -51,24 +51,25 @@ unsigned int rd_FIFO(volatile unsigned int *FIFO_status_addr,
 	return i;
 }
 
-void buf32_to_buf16(unsigned int * buf32, unsigned int * buf16,
-		unsigned int length)
+void buf32_to_buf16(int * buf32, unsigned int * buf16, unsigned int length)
 {
 	unsigned int i, j;
 
 	j = 0;
 	for (i = 0; i < (length); i++)
 	{
-		buf16[j++] = (buf32[i] & 0x3FFF);		// 14 significant bit
-		buf16[j++] = ((buf32[i] >> 16) & 0x3FFF);	// 14 significant bit
+		buf16[j++] = ((unsigned int) buf32[i] & 0x3FFF); // 14 significant bit
+		buf16[j++] = ((unsigned int) (buf32[i] >> 16) & 0x3FFF); // 14 significant bit
 	}
 
 }
 
-void wr_File(char * pathname, unsigned int length, unsigned int* buf)
+void wr_File(char * pathname, unsigned int length, int * buf,
+		char binary_OR_ascii)
 {
 
-	long i;
+	// binary_OR_ascii = 1 save binary output into the text file (1). Otherwise, it'll be ASCII output (0)
+
 	FILE *fptr;
 
 	fptr = fopen(pathname, "w");
@@ -76,11 +77,23 @@ void wr_File(char * pathname, unsigned int length, unsigned int* buf)
 	{
 		printf("File does not exists \n");
 	}
-	for (i = 0; i < ((length)); i++)
-	{
-		fprintf(fptr, "%d\n", buf[i]);
+
+	if (binary_OR_ascii)
+	{ // binary output
+		fwrite(buf, sizeof(uint16_t), length, fptr);
 	}
-	fclose(fptr);
+
+	else
+	{ // ascii output
+		long i;
+
+		for (i = 0; i < ((length)); i++)
+		{
+			fprintf(fptr, "%d\n", buf[i]);
+		}
+
+	}
+
 }
 
 void print_progress(int iterate, int number_of_iteration)
