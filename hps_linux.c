@@ -3,6 +3,9 @@
 // any functions except cpmg_iterate needs to use GET_RAW_DATA. cpmg_iterate can either use GET_RAW_DATA or GET_DCONV_DATA
 
 #include "hps_linux.h"
+#include "functions/general.h"
+#include <sys/stat.h>
+#include <sys/types.h>
 
 void open_physical_memory_device()
 {
@@ -176,7 +179,9 @@ void create_measurement_folder(char * foldertype)
 			tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec,
 			foldertype);
 	sprintf(command, "mkdir %s", foldername);
-	system(command);
+	mkdir(foldername, 0700);
+	//system(command);
+
 
 	// copy the executable file to the folder
 	// sprintf(command,"cp ./thesis_nmr_de1soc_hdl2.0 %s/execfile",foldername);
@@ -823,7 +828,7 @@ void runFSM(double nmr_fsm_clkfreq, uint32_t ph_cycl_en,
 
 	// read settings
 	// uint8_t store_to_sdram_noread = 0; // do not write the data from fifo to text file (external reading mechanism should be implemented)
-	// uint8_t rd_sdram_OR_rd_fifo = 1; // store data to sdram (increasing memory limit). Or else the program reads data directly from the fifo
+	//uint8_t rd_sdram_OR_rd_fifo = 0; // store data to sdram (increasing memory limit). Or else the program reads data directly from the fifo
 
 	// read the current ctrl_out
 	ctrl_out = alt_read_word(h2p_ctrl_out_addr);
@@ -922,6 +927,7 @@ void runFSM(double nmr_fsm_clkfreq, uint32_t ph_cycl_en,
 		if (rd_sdram_OR_n_rd_fifo)
 		{ // read from sdram
 			data_dconv_write_with_dma (acq_length, DISABLE_MESSAGE);
+			//while ( alt_read_word(h2p_ctrl_in_addr) & (0x01<<NMR_SEQ_run_ofst) ); // might not be needed as the system will wait until data is available anyway
 		}
 		else
 		{ // read directly from fifo
@@ -939,7 +945,7 @@ void runFSM(double nmr_fsm_clkfreq, uint32_t ph_cycl_en,
 		{ // put the individual scan data into an individual file
 			{ // put the individual scan data into a file
 				sprintf(pathname,"%s/%s",foldername,filename);// create a filename
-				wr_File (pathname, acq_length, dconv);// write the data to the filename
+				wr_File (pathname, acq_length, dconv, SAV_BINARY);// write the data to the filename
 			}
 		}
 	}
@@ -974,7 +980,7 @@ void CPMG_Sequence(double cpmg_freq, double pulse1_us, double pulse2_us,
 	alt_write_word(h2p_rx_delay_addr, rx_dly);
 	double rx_dly_us_achieved = (double) rx_dly / adc_ltc1746_freq;
 
-	// printf("nilai = %d\n", samples_per_echo % dconv_fact);
+	//printf("nilai = %d\n", samples_per_echo % dconv_fact);
 	if (samples_per_echo % dconv_fact != 0)
 	{
 		printf("\t[ERROR] (samples_per_echo/dconv_fact) is not an integer!\n");
@@ -1065,7 +1071,7 @@ void CPMG_Sequence(double cpmg_freq, double pulse1_us, double pulse2_us,
 
 #ifdef GET_RAW_DATA
 	runFSM(nmr_fsm_clkfreq, ph_cycl_en, samples_per_echo * echoes_per_scan,
-			filename, NO_SAV_INDV_SCAN, RD_DATA_VIA_SDRAM_OR_FIFO, RD_SDRAM);
+			filename, NO_SAV_INDV_SCAN, RD_DATA_VIA_SDRAM_OR_FIFO, RD_FIFO);
 #endif
 #ifdef GET_DCONV_DATA
 	unsigned int dconv_data_len = samples_per_echo * echoes_per_scan * 2 / dconv_fact; // *2 is because the IQ data is combined into 1 stream
@@ -1314,6 +1320,256 @@ void CPMG_iterate(double cpmg_freq, double pulse1_us, double pulse2_us,
 	else
 	{ // ascii output
 		for (i = 0; i < dconv_size; i++) fprintf(fptr, "%d\n", (int)dconv_sum[i]);
+	}
+	fclose(fptr);
+#endif
+
+	if (progress_verbose)
+	{
+		printf("\t done!\n");
+	}
+
+	free(name);
+	free(nameavg);
+
+}
+
+// allow different frequencies run in one wait time
+void CPMG_iterate_jump(double *cpmg_freq, double *pulse1_us, double *pulse2_us,
+		double pulse1_dtcl, double pulse2_dtcl, double echo_spacing_us,
+		long unsigned scan_spacing_us, unsigned int samples_per_echo,
+		unsigned int echoes_per_scan, double *init_adc_delay_compensation,
+		unsigned int number_of_iteration, uint32_t ph_cycl_en, unsigned int num_freq,
+		unsigned int  *cshunt, unsigned int  *cseries, double *vbias, double *vvarac)
+{
+
+// settings
+	char progress_verbose = 1; // print progress
+	char binary_OR_ascii = 1; // save binary output into the text file (1). Otherwise, it'll be ASCII output (0)
+
+	double nmr_fsm_clkfreq = 16 * cpmg_freq[0];
+	double adc_ltc1746_freq = 4 * cpmg_freq[0];
+
+// read the current ctrl_out
+	ctrl_out = alt_read_word(h2p_ctrl_out_addr);
+
+	create_measurement_folder("cpmg_jump");
+// printf("Approximated measurement time : %.2f mins\n",( scan_spacing_us*(double)number_of_iteration) *1e-6/60);
+
+	unsigned int cpmg_param[5];
+	cpmg_param_calculator_ltc1746(cpmg_param, nmr_fsm_clkfreq, cpmg_freq[0],
+			adc_ltc1746_freq, init_adc_delay_compensation[0], pulse1_us[0], pulse2_us[0],
+			echo_spacing_us, samples_per_echo);
+// print general measurement settings
+	sprintf(pathname, "%s/acqu.par", foldername);
+	fptr = fopen(pathname, "a");
+	fprintf(fptr, "b1Freq = %4.3f\n", cpmg_freq[0]);
+	fprintf(fptr, "p90LengthGiven = %4.3f\n", pulse1_us[0]);
+	fprintf(fptr, "p90LengthRun = %4.3f\n",
+			(double) cpmg_param[PULSE1_OFFST] / nmr_fsm_clkfreq);
+	fprintf(fptr, "p90LengthCnt = %d @ %4.3f MHz\n", cpmg_param[PULSE1_OFFST],
+			nmr_fsm_clkfreq);
+	fprintf(fptr, "d90LengthRun = %4.3f\n",
+			(double) cpmg_param[DELAY1_OFFST] / nmr_fsm_clkfreq);
+	fprintf(fptr, "d90LengthCnt = %d @ %4.3f MHz\n", cpmg_param[DELAY1_OFFST],
+			nmr_fsm_clkfreq);
+	fprintf(fptr, "p180LengthGiven = %4.3f\n", pulse2_us[0]);
+	fprintf(fptr, "p180LengthRun = %4.3f\n",
+			(double) cpmg_param[PULSE2_OFFST] / nmr_fsm_clkfreq);
+	fprintf(fptr, "p180LengthCnt =  %d @ %4.3f MHz\n", cpmg_param[PULSE2_OFFST],
+			nmr_fsm_clkfreq);
+	fprintf(fptr, "d180LengthRun = %4.3f\n",
+			(double) cpmg_param[DELAY2_OFFST] / nmr_fsm_clkfreq);
+	fprintf(fptr, "d180LengthCnt = %d @ %4.3f MHz\n", cpmg_param[DELAY2_OFFST],
+			nmr_fsm_clkfreq);
+//fprintf(fptr,"p90_dtcl = %4.3f\n", pulse1_dtcl);
+//fprintf(fptr,"p180_dtcl = %4.3f\n", pulse2_dtcl);
+	fprintf(fptr, "echoTimeRun = %4.3f\n",
+			(double) (cpmg_param[PULSE2_OFFST] + cpmg_param[DELAY2_OFFST])
+					/ nmr_fsm_clkfreq);
+	fprintf(fptr, "echoTimeGiven = %4.3f\n", echo_spacing_us);
+	fprintf(fptr, "ieTime = %lu\n", scan_spacing_us / 1000);
+	fprintf(fptr, "nrPnts = %d\n", samples_per_echo);
+	fprintf(fptr, "nrEchoes = %d\n", echoes_per_scan);
+	fprintf(fptr, "echoShift = %4.3f\n", init_adc_delay_compensation[0]);
+	fprintf(fptr, "nrIterations = %d\n", number_of_iteration);
+	fprintf(fptr, "dummyEchoes = 0\n");
+	fprintf(fptr, "adcFreq = %4.3f\n", adc_ltc1746_freq);
+	fprintf(fptr, "usePhaseCycle = %d\n", ph_cycl_en);
+//-------------------------------------------------------------------------------
+	fprintf(fptr, "numFreq = %d\n", num_freq);
+//-------------------------------------------------------------------------------
+
+#ifdef GET_RAW_DATA
+	fprintf(fptr, "dwellTime = %4.3f\n", 1 / adc_ltc1746_freq);
+	fprintf(fptr, "fpgaDconv = 0\n");
+	fprintf(fptr,"dconvFact = 1\n");
+#endif
+#ifdef GET_DCONV_DATA
+	fprintf(fptr, "dwellTime = %4.3f\n", 1 / adc_ltc1746_freq*dconv_fact);
+	fprintf(fptr, "fpgaDconv = 1\n");
+	fprintf(fptr,"dconvFact = %d\n", dconv_fact);
+#endif
+	fclose (fptr);
+
+// print matlab script to analyze datas
+	sprintf(pathname, "measurement_history_matlab_script.txt");
+	fptr = fopen(pathname, "a");
+	fprintf(fptr, "compute_iterate([data_folder,'%s']);\n", foldername);
+	fclose(fptr);
+
+// print matlab script to analyze datas
+	sprintf(pathname, "current_folder.txt");
+	fptr = fopen(pathname, "w");
+	fprintf(fptr, "%s\n", foldername);
+	fclose(fptr);
+
+	int iterate = 1;
+	int freq_step = 1;
+
+	int FILENAME_LENGTH = 100;
+	char *name;
+	name = (char*) malloc(FILENAME_LENGTH * sizeof(char));
+	char *nameavg;
+	nameavg = (char*) malloc(FILENAME_LENGTH * sizeof(char));
+
+// amplitude sum
+#ifdef GET_RAW_DATA
+	float Asum_all[samples_per_echo*echoes_per_scan*num_freq];
+	for (j=0; j< samples_per_echo*echoes_per_scan*num_freq; j++)
+		Asum_all[i] = 0;
+#endif
+
+#ifdef GET_DCONV_DATA
+// downconverted sum
+	int dconv_size = samples_per_echo*echoes_per_scan*num_freq/dconv_fact*2;
+	printf ("dconv_size = %d\n", dconv_size); // print the buffer size
+	//float dconv_sum[dconv_size/num_freq];
+	//for (i=0; i < dconv_size/num_freq; i++) dconv_sum[i] = 0;
+
+	float dconv_sum_all[dconv_size];
+	for (j=0; j< dconv_size; j++)
+		dconv_sum_all[j] = 0;
+#endif
+
+	if (progress_verbose)
+	{
+		printf("\tPROGRESS: \n");
+	}
+
+	for (iterate = 1; iterate <= number_of_iteration; iterate++)
+	{
+		// printf("\n*** RUN %d ***\n",iterate);
+		if (progress_verbose)
+			print_progress(iterate, number_of_iteration);
+
+		for (freq_step = 1; freq_step <= num_freq; freq_step++)
+		{
+			//printf("%d\n", freq_step);
+			snprintf(name, FILENAME_LENGTH, "dat_%03d_%03d", iterate, freq_step);
+			snprintf(nameavg, FILENAME_LENGTH, "avg_%03d_%03d", iterate, freq_step);
+
+			 write_relay_cnt(cshunt[freq_step-1], cseries[freq_step-1], DISABLE_MESSAGE);
+
+			 init_dac_ad5724r();			// power up the dac and init its operation
+			 // wr_dac_ad5724 IS A NEW FUNCTION AND IS NOT VERIFIED!!!!!
+			 wr_dac_ad5724r (h2p_dac_preamp_addr, DAC_A, vbias[freq_step-1], DISABLE_MESSAGE); // vbias cannot exceed 1V, due to J310 transistor gate voltage
+			 wr_dac_ad5724r (h2p_dac_preamp_addr, DAC_B, vvarac[freq_step-1], DISABLE_MESSAGE);
+
+			CPMG_Sequence(cpmg_freq[freq_step-1],				//cpmg_freq
+					pulse1_us[freq_step-1],				//pulse1_us
+					pulse2_us[freq_step-1],				//pulse2_us
+					pulse1_dtcl,				//pulse1_dtcl
+					pulse2_dtcl,				//pulse2_dtcl
+					echo_spacing_us,				//echo_spacing_us
+					scan_spacing_us,				//scan_spacing_us
+					samples_per_echo,				//samples_per_echo
+					echoes_per_scan,				//echoes_per_scan
+					init_adc_delay_compensation[freq_step-1],//compensation delay number (counted by the adc base clock)
+					ph_cycl_en,				//phase cycle enable/disable
+					name,				//filename for data
+					nameavg,				//filename for average data
+					DISABLE_MESSAGE);
+
+#ifdef GET_RAW_DATA
+		// process the data
+		if (ph_cycl_en)
+		{
+			if (iterate % 2 == 0)
+			{
+				for (i = 0; i < samples_per_echo * echoes_per_scan; i++)
+					//Asum[i] -= (float)rddata_16[i]/(float)number_of_iteration;
+					Asum_all[i + (freq_step-1)*dconv_size/num_freq] -= (float)rddata_16[i]/(float)number_of_iteration;
+			}
+			else
+			{
+				for (i = 0; i < samples_per_echo * echoes_per_scan; i++)
+					//Asum[i] += (float)rddata_16[i]/(float)number_of_iteration;
+					Asum_all[i + (freq_step-1)*dconv_size/num_freq] -= (float)rddata_16[i]/(float)number_of_iteration;
+			}
+		}
+		else
+		{
+			for (i = 0; i < samples_per_echo * echoes_per_scan; i++)
+				//Asum[i] += (double)rddata_16[i]/(float)number_of_iteration;
+				Asum_all[i + (freq_step-1)*dconv_size/num_freq] += (double)rddata_16[i]/(float)number_of_iteration;
+		}
+
+#endif
+
+#ifdef GET_DCONV_DATA
+		if (ph_cycl_en)
+		{
+			if (iterate % 2 == 0)
+			{
+				for (i = 0;	i < dconv_size/num_freq; i++)
+					//dconv_sum[i] -= (float)dconv[i] / (float)number_of_iteration;
+					dconv_sum_all[i + (freq_step - 1)*dconv_size/num_freq] -= (float)dconv[i] / (float)number_of_iteration;
+			}
+			else
+			{
+				for (i = 0;	i < dconv_size/num_freq; i++)
+					//dconv_sum[i] += (float)dconv[i] / (float)number_of_iteration;
+					dconv_sum_all[i + (freq_step - 1)*dconv_size/num_freq] += (float)dconv[i] / (float)number_of_iteration;
+			}
+		}
+		else
+		{
+			for (i = 0; i < dconv_size/num_freq; i++)
+				dconv_sum_all[i + (freq_step - 1)*dconv_size/num_freq] += (float)dconv[i] / (float)number_of_iteration;
+		}
+		//dconv_sum_all[(freq_step - 1)*samples_per_echo*echoes_per_scan] = dconv_sum;
+#endif
+		}
+	}
+
+#ifdef GET_RAW_DATA
+// write raw data sum
+	sprintf(pathname, "%s/%s", foldername, "asum");// put the data into the data folder
+	fptr = fopen(pathname, "w");
+	if (binary_OR_ascii)
+	{ // binary output
+			fwrite(&Asum_all, sizeof(float), samples_per_echo * echoes_per_scan * num_freq, fptr);
+	}
+	else
+	{ // ascii output
+		for (i = 0; i < samples_per_echo*echoes_per_scan*num_freq; i++)
+		fprintf(fptr, "%d\n", (int)Asum_all[i]);
+	}
+	fclose(fptr);
+#endif
+
+#ifdef GET_DCONV_DATA
+// write downconverted data sum in-phase
+	sprintf(pathname, "%s/%s", foldername, "dconv");// put the data into the data folder
+	fptr = fopen(pathname, "w");
+	if (binary_OR_ascii)
+	{ // binary output
+		fwrite(&dconv_sum_all, sizeof(float), dconv_size, fptr);
+	}
+	else
+	{ // ascii output
+		for (i = 0; i < dconv_size; i++) fprintf(fptr, "%d\n", (int)dconv_sum_all[i]);
 	}
 	fclose(fptr);
 #endif
@@ -1974,7 +2230,7 @@ void close_system()
  return 0;
  }
  */
-
+/*
 // Wobble (rename the output to "wobble")
 int main(int argc, char * argv[])
 {
@@ -2057,7 +2313,7 @@ int main(int argc, char * argv[])
  }
  */
 
-/* CPMG Iterate
+ //*CPMG Iterate
  // rename the output to "cpmg_iterate_raw" and define GET_RAW_DATA to get raw data.
  // rename the output to "cpmg_iterate_dconv" and define GET_RAW_DCONV to get downconverted data.
  // if CPMG Sequence is used without writing to text file, rename the output to "cpmg_iterate_direct". Use STORE_TO_SDRAM_NOREAD in the cpmg_Sequence
@@ -2137,7 +2393,8 @@ int main(int argc, char * argv[])
  // alt_write_word(h2p_dconv_firQ_addr, 20);
  //
 
- / *********************************************************************
+/*
+ // *********************************************************************
  // ************************** TEST CODE ********************************
  int64_t datatest;
  alt_write_dword(h2p_sdram_addr, 0xAAAA88881111FFFF);
@@ -2169,6 +2426,7 @@ int main(int argc, char * argv[])
  printf("%ld", datatest);
  // ******************************************************************** /
  // ******************************************************************** /
+*/
 
  alt_write_word(h2p_adc_val_sub, 9275); // do noise measurement and all the data to get this ADC DC bias integer value
 
@@ -2192,7 +2450,164 @@ int main(int argc, char * argv[])
 
  return 0;
  }
- */
+
+
+/*
+//CPMG Iterate jump
+// maximum 4 freq input
+ // rename the output to "cpmg_iterate_raw" and define GET_RAW_DATA to get raw data.
+ // rename the output to "cpmg_iterate_dconv" and define GET_RAW_DCONV to get downconverted data.
+ // if CPMG Sequence is used without writing to text file, rename the output to "cpmg_iterate_direct". Use STORE_TO_SDRAM_NOREAD in the cpmg_Sequence
+ int main(int argc, char * argv[])
+ {
+ // this program can only be run with the power supply 'on' that enables ADC circuitry and clock.
+ // To turn on the power supply, you can use the Python code and add breakpoint before CPMG_sequence().
+ // printf("NMR system start\n");
+
+ // input parameters
+ double cpmg_freq[] = {atof(argv[1]),atof(argv[2]), atof(argv[3]), atof(argv[4])};
+ double pulse1_us[] = {atof(argv[5]),atof(argv[6]), atof(argv[7]), atof(argv[8])};
+ double pulse2_us[] = {atof(argv[9]),atof(argv[10]), atof(argv[11]), atof(argv[12])};
+
+ double pulse1_dtcl = atof(argv[13]);
+ double pulse2_dtcl = atof(argv[14]);
+ double echo_spacing_us = atof(argv[15]);
+ long unsigned scan_spacing_us = atoi(argv[16]);
+ unsigned int samples_per_echo = atoi(argv[17]);
+ unsigned int echoes_per_scan = atoi(argv[18]);
+
+ double init_adc_delay_compensation[] = {atof(argv[19]),atof(argv[20]), atof(argv[21]), atof(argv[22])};
+
+ unsigned int number_of_iteration = atoi(argv[23]);
+ uint32_t ph_cycl_en = atoi(argv[24]);
+ unsigned int pulse180_t1_int = atoi(argv[25]);
+ unsigned int delay180_t1_int = atoi(argv[26]);
+ unsigned int tx_opa_sd = atoi(argv[27]);	// shutdown tx during reception
+ dconv_fact = atoi(argv[28]);	// down conversion factor
+
+ //-----------------------------------
+ unsigned int  num_freq = atoi(argv[29]);
+
+ // input matching network parameters
+ unsigned int cshunt[] = {atoi(argv[30]), atoi(argv[31]),atoi(argv[32]), atoi(argv[33])};
+ unsigned int cseries[] = {atoi(argv[34]), atoi(argv[35]),atoi(argv[36]), atoi(argv[37])};
+
+ // input preamp parameters
+ double vbias[] = {atof(argv[38]),atof(argv[39]), atof(argv[40]), atof(argv[41])};
+ double vvarac[] = {atof(argv[42]),atof(argv[43]), atof(argv[44]), atof(argv[45])};
+
+ // memory allocation
+ #ifdef GET_RAW_DATA
+ //rddata_16 = (unsigned int*)malloc(samples_per_echo*echoes_per_scan*sizeof(unsigned int)); // added malloc to this routine only - other routines will need to be updated when required
+ rddata_16 = (unsigned int*)malloc(samples_per_echo*echoes_per_scan	*sizeof(unsigned int)); // added malloc to this routine only - other routines will need to be updated when required
+
+ rddata = (int *)malloc(samples_per_echo*echoes_per_scan/2*sizeof(int));// petrillo 2Feb2019
+ #endif
+ #ifdef GET_DCONV_DATA
+ dconv = (int *) malloc(
+ samples_per_echo * echoes_per_scan * sizeof(int) / dconv_fact * 2); // multiply 2 because of IQ data
+ #endif
+
+ open_physical_memory_device();
+ mmap_peripherals();
+ // init_default_system_param();
+
+ // write t1-IR measurement parameters (put both to 0 if IR is not desired)
+ alt_write_word(h2p_t1_pulse, pulse180_t1_int);
+ alt_write_word(h2p_t1_delay, delay180_t1_int);
+
+ // write downconversion factor
+ alt_write_word(h2p_dec_fact_addr, dconv_fact);
+
+ // read the current ctrl_out
+ ctrl_out = alt_read_word(h2p_ctrl_out_addr);
+
+ // enable the TX opamp during reception, will be controlled using the tx_opa_sd instead
+ ctrl_out = ctrl_out | TX_OPA_EN;
+ alt_write_word((h2p_ctrl_out_addr), ctrl_out);
+
+ if (tx_opa_sd)
+ { // shutdown tx opamp during reception
+ ctrl_out = ctrl_out | TX_OPA_SD_MSK;
+ alt_write_word((h2p_ctrl_out_addr), ctrl_out);
+ }
+ else
+ { // power up tx opamp all the way during reception
+ ctrl_out = ctrl_out & (~TX_OPA_SD_MSK);
+ alt_write_word((h2p_ctrl_out_addr), ctrl_out);
+ }
+
+ // read and write fir coefficients
+ // fir registers cannot be read like a standard avalon-mm registers, it has sequence if the setting is set to read/write mode
+ // look at the fir user guide to see this sequence
+ // however, it can be set just to read mode or write mode and it supposed to work with avalon-mm
+ ctrl_out &= ~(DCONV_FIR_RST_RESET_N | DCONV_FIR_Q_RST_RESET_N);	// reset the FIR filter
+ alt_write_word(h2p_ctrl_out_addr, ctrl_out);	// write down the control
+ usleep(1);
+ ctrl_out |= (DCONV_FIR_RST_RESET_N | DCONV_FIR_Q_RST_RESET_N);// enable the FIR filter
+ alt_write_word(h2p_ctrl_out_addr, ctrl_out);	// write down the control
+ usleep(1);
+ // alt_write_word(h2p_dconv_firQ_addr, 20);
+ //
+/*
+ // *********************************************************************
+ // ************************** TEST CODE ********************************
+ int64_t datatest;
+ alt_write_dword(h2p_sdram_addr, 0xAAAA88881111FFFF);
+ datatest = alt_read_dword(h2p_sdram_addr);
+
+ alt_write_dword(h2p_fifoin64dummy_addr, 0xAAAABBBBCCCCDDDD);
+ datatest = alt_read_word(
+ h2p_fifoout64csrdummy_addr + ALTERA_AVALON_FIFO_LEVEL_REG); // the fill level of FIFO memory
+ //datatest = alt_read_dword(h2p_fifoout64dummy_addr);
+ reset_dma (h2p_dmadummy_addr);
+ fifo_to_sdram_dma_trf(h2p_dmadummy_addr, FIFO_DUMMY64_OUT_OUT_BASE,
+ DMA_DUMMY_WRITE_MASTER_SDRAM_BASE, 1);
+ check_dma(h2p_dmadummy_addr, ENABLE_MESSAGE);
+ datatest = alt_read_dword(h2p_sdram_addr);
+ printf("datatest: %li\n", datatest);
+ datatest = alt_read_word(
+ h2p_fifoout64csrdummy_addr + ALTERA_AVALON_FIFO_LEVEL_REG); // the fill level of FIFO memory
+
+ alt_write_dword(h2p_sdram_addr, 0xAAAA88881111FFFF);
+ datatest = alt_read_dword(h2p_sdram_addr);
+ printf("datatest: %li\n", datatest);
+
+ alt_write_dword(h2p_fifoin_dummy_addr, 0xAAAABBBBCCCCDDDD);
+ datatest = alt_read_word(
+ h2p_fifoincsr_dummy_addr + ALTERA_AVALON_FIFO_LEVEL_REG); // the fill level of FIFO memory
+ datatest = alt_read_dword(h2p_fifoout_dummy_addr);
+ datatest = alt_read_word(
+ h2p_fifoincsr_dummy_addr + ALTERA_AVALON_FIFO_LEVEL_REG); // the fill level of FIFO memory
+ printf("%ld", datatest);
+ // ******************************************************************** /
+ // ********************************************************************* /
+
+
+ alt_write_word(h2p_adc_val_sub, 9275); // do noise measurement and all the data to get this ADC DC bias integer value
+
+ // printf("cpmg_freq = %0.3f\n",cpmg_freq);
+ CPMG_iterate_jump(cpmg_freq, pulse1_us, pulse2_us, pulse1_dtcl, pulse2_dtcl,
+ echo_spacing_us, scan_spacing_us, samples_per_echo, echoes_per_scan,
+ init_adc_delay_compensation, number_of_iteration, ph_cycl_en,
+ num_freq, cshunt, cseries, vbias, vvarac);
+
+ // close_system();
+ munmap_peripherals();
+ close_physical_memory_device();
+
+ // free memory
+ #ifdef GET_RAW_DATA
+ free(rddata_16);	//freeing up allocated memory required for multiple calls from host
+ free(rddata);//petrillo 2Feb2019
+ #endif
+ #ifdef GET_DCONV_DATA
+ free (dconv);
+ #endif
+
+ return 0;
+ }
+
 
 /* FID Iterate (rename the output to "fid")
  int main(int argc, char * argv[])
